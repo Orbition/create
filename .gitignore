@@ -1,0 +1,5 @@
+node_modules/
+
+# Package archives never belong in this repository. The tests build their own
+# synthetic ones in a temporary directory.
+*.tgz
