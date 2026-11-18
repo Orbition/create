@@ -17,6 +17,7 @@ test('the package would hold the installer and nothing meant for this repository
     'README.md',
     'package.json',
     'src/archive.js',
+    'src/download.js',
     'src/errors.js',
     'src/install.js',
     'src/manifest.js',

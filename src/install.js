@@ -187,6 +187,8 @@ async function installLocked({ directory, source, entries, names, version, invok
     try {
       bytes = Buffer.from(await source.read(entry.file));
     } catch (error) {
+      // A source's own refusal already says what happened and what to do.
+      if (error instanceof InstallError) throw error;
       throw new InstallError(`${entry.file} could not be read: ${error.message}`);
     }
     verifyArchive(entry, bytes);
@@ -208,6 +210,10 @@ async function installLocked({ directory, source, entries, names, version, invok
       declared: declaredDependency(project.manifest, name) !== undefined,
     });
   }
+
+  // Every archive this run needs is in memory now. A source that holds a
+  // credential lets it go here, before anything is written or started.
+  source.close?.();
 
   // The two files this run may replace, as they are now: what a failure puts
   // back, permissions included.
