@@ -35,6 +35,19 @@ export function temporaryDirectory(label) {
   return directory;
 }
 
+/** A self-signed certificate for 127.0.0.1, good for these tests only, and where its PEM file is. */
+export function certificate() {
+  const directory = temporaryDirectory('tls');
+  const key = path.join(directory, 'key.pem');
+  const cert = path.join(directory, 'cert.pem');
+  run('openssl', [
+    ...['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2'],
+    ...['-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'],
+    ...['-keyout', key, '-out', cert],
+  ]);
+  return { key: readFileSync(key), cert: readFileSync(cert), certPath: cert };
+}
+
 export function run(command, args, cwd) {
   return execFileSync(command, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }

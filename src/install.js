@@ -119,7 +119,18 @@ function lock(directory) {
   return () => rmSync(file, { force: true });
 }
 
-async function installLocked({ directory, source, entries, names, version, invokedBy }) {
+/**
+ * What every run checks of the project before anything else, and the command
+ * checks when the folder is chosen: a `package.json` that is a real file and
+ * valid JSON, an npm or pnpm project that is not part of a workspace, and a
+ * lockfile and retained directory that are not links. Reads only. The install
+ * lock is not among these: `install` takes it, and refuses then, if another
+ * installer holds it.
+ *
+ * @param {string} directory
+ * @param {string | undefined} invokedBy
+ */
+export function checkProject(directory, invokedBy) {
   const project = readProject(directory);
   const packageManager = detectPackageManager(project, invokedBy);
   refuseWorkspace(directory, packageManager);
@@ -139,6 +150,12 @@ async function installLocked({ directory, source, entries, names, version, invok
       );
     }
   }
+  return { project, packageManager, lockfile, lockfilePath };
+}
+
+async function installLocked({ directory, source, entries, names, version, invokedBy }) {
+  const { project, packageManager, lockfile, lockfilePath } = checkProject(directory, invokedBy);
+  const segments = RETAINED_DIRECTORY.split('/');
   const retainedPath = (file) => path.join(directory, ...segments, file);
 
   // A Design System package the project already declares must be this

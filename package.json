@@ -4,6 +4,9 @@
   "private": true,
   "description": "Installer for Orbition Design System and Foundation.",
   "type": "module",
+  "bin": {
+    "create": "src/cli.js"
+  },
   "files": [
     "src"
   ],
