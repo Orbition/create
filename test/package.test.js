@@ -22,7 +22,9 @@ test('the package would hold the installer and nothing meant for this repository
     'src/errors.js',
     'src/install.js',
     'src/manifest.js',
+    'src/menu.js',
     'src/project.js',
+    'src/selection.js',
   ]);
 });
 

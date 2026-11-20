@@ -5,8 +5,9 @@ Home of `@orbition/create`, the planned installer for Orbition Design System and
 ## Try the command locally
 
 The command so far welcomes you, has you sign in in your browser, confirms
-that sign-in with the site, asks for the project folder and checks it, then
-stops. It changes nothing and downloads nothing.
+that sign-in with the site, asks for the project folder and checks it, lets
+you choose what to add, and shows a review of what adding it would change.
+It changes nothing and downloads nothing.
 
 Until the Orbition site's address is confirmed, the command works only with a
 local test site, `https://127.0.0.1:<port>` (a port other than 443), and only
@@ -47,6 +48,27 @@ the browser to its own configured address. The browser warns about the
 self-signed certificate until you accept it. Then answer the folder question;
 Enter takes the current folder.
 
+Then choose what to add, with the keys: Up and Down move, Space marks a
+renderer, Enter chooses, Ctrl+C stops (as does Ctrl+D, or the input ending).
+Keys pasted together with the Enter that chooses are dropped; keys typed
+after it are kept and answer the next list once it is shown.
+
+1. **What would you like to add?** Builder and Foundation are shown as coming
+   soon and cannot be chosen; Enter takes Design System 0.1.0.
+2. **Which do you use?** React (marked at first), Web Components (plain HTML),
+   or both; at least one must be marked.
+3. **Review**: the project and its package manager, the packages (Core once,
+   then each renderer), the archives that would be kept in `vendor/orbition`,
+   `package.json` and the lockfile, and the install command that would follow.
+   Then **Finish the preview** (ends the run, nothing changed), **Change
+   selections** (back to step 1 with your last answers; the sign-in and the
+   folder stand), or **Cancel** (ends the run, nothing changed).
+
+The archive names are the ones the release is expected to have: nothing is
+fetched yet. A project's name and folder are shown as plain text: any
+control, direction-changing or invisible character is written as a `\u`
+escape, and a backslash is doubled.
+
 How the sign-in is confirmed: each run makes its own random state and PKCE
 verifier, and the browser opens
 `/terminal/sign-in?port=<port>&state=<state>&code_challenge=<challenge>&code_challenge_method=S256`.
@@ -61,8 +83,8 @@ certificate the given authority does not vouch for, a redirect or no answer
 within 15 seconds ends the run with nothing changed. The code and the
 verifier are never shown or logged.
 
-What a confirmed sign-in grants: nothing. The folder question that follows
-reads only local files and changes none. Everything protected stays with the
+What a confirmed sign-in grants: nothing. The questions that follow read
+only local files and change none. Everything protected stays with the
 site, which checks the account itself on each request: approving a release,
 exchanging that approval for a short-lived credential, and every download
 with it (not built in this command yet). `node src/cli.js --help` and

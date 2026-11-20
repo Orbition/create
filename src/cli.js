@@ -3,9 +3,11 @@
 // `pnpm dlx @orbition/create` once published, `node src/cli.js` in a checkout.
 //
 // So far it welcomes the person, has them sign in in the browser, confirms
-// that sign-in with the site, asks for the project folder and checks it, then
-// stops. Choosing what to add, approving a release and downloading come
-// later. Nothing in the project is changed.
+// that sign-in with the site, asks for the project folder and checks it, has
+// them choose what to add (the Design System and its renderers) and shows a
+// review of what adding it would change, then stops. The selections can be
+// changed from the review without signing in again. Approving a release,
+// downloading and installing come later. Nothing in the project is changed.
 //
 // The site: until the Orbition site's address is confirmed, only a local test
 // site at https://127.0.0.1:<port> is accepted (--origin or ORBITION_ORIGIN),
@@ -43,6 +45,8 @@ import { parseArgs } from 'node:util';
 
 import { InstallError } from './errors.js';
 import { checkProject } from './install.js';
+import { choose } from './menu.js';
+import { listed, plain, PRODUCTS, RENDERERS, reviewLines } from './selection.js';
 
 /** How long the browser has to sign in once the link is shown, as on the site. */
 export const SIGN_IN_MS = 10 * 60 * 1000;
@@ -85,7 +89,11 @@ const REFUSALS = {
 const HELP = `Adds Orbition to an existing npm or pnpm project.
 
 For now it signs you in in your browser, asks for the project folder and checks
-it, then stops. Nothing is changed.
+it, lets you choose what to add, and shows a review of what that would change.
+Nothing is changed and nothing is downloaded.
+
+Keys in the lists: Up and Down move, Space marks a renderer, Enter chooses,
+Ctrl+C stops.
 
 Usage:
   node src/cli.js [--origin <url>] [--ca <file>]    (in a checkout)
@@ -585,9 +593,10 @@ export async function main({
     say();
 
     // The project, checked at once; asked again until it can be used.
+    let project;
     for (;;) {
-      const answer = (await ask('Which project folder? (a path from here; Enter for this one) ')).trim();
-      const chosen = path.resolve(cwd, answer === '' ? '.' : answer);
+      const typed = (await ask('Which project folder? (a path from here; Enter for this one) ')).trim();
+      const chosen = path.resolve(cwd, typed === '' ? '.' : typed);
       try {
         if (!statSync(chosen, { throwIfNoEntry: false })?.isDirectory()) {
           throw new InstallError(`There is no folder at ${chosen}.`);
@@ -595,21 +604,68 @@ export async function main({
         // The folder as the package manager will see it: its real path, so
         // the workspace above it is the one that counts.
         const directory = realpathSync(chosen);
-        const { project, packageManager } = checkProject(directory, launcher(env));
-        const { name } = project.manifest;
+        const checked = checkProject(directory, launcher(env));
+        const { packageManager } = checked;
+        const { name } = checked.project.manifest;
         const label = typeof name === 'string' && name !== '' ? name : path.basename(directory);
-        say(`  ${label} uses ${packageManager}.`);
+        say(`  ${plain(label)} uses ${packageManager}.`);
+        project = { label, directory, packageManager };
         break;
       } catch (error) {
         // A refusal, or a folder that cannot be read: say so and ask again.
-        if (error instanceof InstallError) say(`  ${error.message}`);
-        else if (typeof error?.code === 'string') say(`  Could not read ${chosen}: ${error.message}`);
+        if (error instanceof InstallError) say(`  ${plain(error.message)}`);
+        else if (typeof error?.code === 'string') say(`  ${plain(`Could not read ${chosen}: ${error.message}`)}`);
         else throw error;
       }
     }
     say();
-    say('That is as far as this version goes: choosing what to add, approving it and');
-    say('downloading come next. Nothing was changed.');
+
+    // What to add, then the review. "Change selections" asks again, starting
+    // from the last answers; the sign-in and the folder stand.
+    const pick = (options) =>
+      choose({ stdin, stdout, signal: stopped.signal, interrupt, ended: inputEnded, ...options });
+    let productIndex = PRODUCTS.findIndex((product) => !product.disabled);
+    let renderers = ['react'];
+    for (;;) {
+      productIndex = await pick({
+        question: 'What would you like to add?',
+        hint: '(Up/Down to move, Enter to choose)',
+        items: PRODUCTS,
+        start: productIndex,
+        summary: (index) => `${PRODUCTS[index].label} ${PRODUCTS[index].version}`,
+      });
+      const product = PRODUCTS[productIndex];
+      const marked = await pick({
+        question: 'Which do you use?',
+        hint: '(Space to mark, one or both; Enter to go on)',
+        items: RENDERERS,
+        multiple: true,
+        marked: RENDERERS.flatMap((renderer, index) => (renderers.includes(renderer.id) ? [index] : [])),
+        summary: (indexes) => listed(indexes.map((index) => RENDERERS[index].label)),
+      });
+      renderers = marked.map((index) => RENDERERS[index].id);
+
+      say();
+      for (const line of reviewLines({ ...project, product, renderers })) say(line);
+      say();
+      const choices = [
+        { label: 'Finish the preview', note: 'approval and download are not built yet' },
+        { label: 'Change selections' },
+        { label: 'Cancel' },
+      ];
+      const next = await pick({
+        question: 'What next?',
+        hint: '(Up/Down to move, Enter to choose)',
+        items: choices,
+        summary: (index) => `${choices[index].label}.`,
+      });
+      if (next === 2) throw new Stop('Cancelled. Nothing was changed.', 1);
+      if (next === 0) break;
+      say();
+    }
+    say();
+    say('That is as far as this version goes: approving the release in your browser,');
+    say('downloading and installing come next. Nothing was changed.');
     return 0;
   } catch (error) {
     if (!(error instanceof Stop)) throw error;
