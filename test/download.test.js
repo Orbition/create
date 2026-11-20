@@ -177,7 +177,7 @@ test('installs into an npm project over HTTPS, fetching only what was chosen', a
 
 test('each refusal of the service is reported by its code, once, and changes nothing', async () => {
   const refusals = [
-    [401, 'sign_in_required', /no longer approved/],
+    [401, 'sign_in_required', /no longer allowed/],
     [403, 'not_entitled', /no current access/],
     [403, 'access_denied', /cannot download yet/],
     [404, 'not_found', /was not found/],
@@ -499,4 +499,27 @@ test('the credential is let go once the archives have arrived, and on request', 
   another.close();
   another.close();
   await assert.rejects(another.read(file), { name: 'InstallError', message: /was closed/ });
+});
+
+test('a signal stops every request, and nothing is asked again once it has', async () => {
+  // The manifest never comes: stopping ends the wait at once, with the signal's reason.
+  service((pathname) => (pathname === `${RELEASE}/manifest` ? { then: 'never' } : undefined));
+  const stopping = new AbortController();
+  const opening = open({ signal: stopping.signal, limits: { manifestMs: 60_000, archiveMs: 60_000 } });
+  for (let tries = 0; tries < 200 && asked('/manifest') === 0; tries += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const reason = new Error('stopped by the person');
+  stopping.abort(reason);
+  await assert.rejects(opening, (error) => error === reason);
+  assert.equal(asked('/manifest'), 1, 'asked again after stopping');
+
+  // An open source stops reading archives too.
+  service();
+  const later = new AbortController();
+  const source = await open({ signal: later.signal });
+  later.abort(reason);
+  await assert.rejects(source.read(entryFor(release.manifest, 'core').file), (error) => error === reason);
+  assert.equal(asked(archive('core')), 0);
+  server.closeAllConnections();
 });
