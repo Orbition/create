@@ -82,6 +82,7 @@ function get({ url, credential, ca, timeoutMs, plan, signal }) {
         agent: false,
         ca,
         rejectUnauthorized: true,
+        ...addressOptions(new URL(url).hostname),
         signal: signal
           ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
           : AbortSignal.timeout(timeoutMs),
@@ -124,6 +125,32 @@ function get({ url, credential, ca, timeoutMs, plan, signal }) {
     outgoing.on('error', (error) => broken(error));
     outgoing.end();
   });
+}
+
+/**
+ * How a request finds its site's address. The name `localhost` is always the
+ * IPv4 loopback address, 127.0.0.1, and never asked of a resolver or the
+ * hosts file: a local app may listen on IPv4 only (::1 would be refused), and
+ * nothing outside this computer can answer for it. The connection still
+ * names `localhost` to the server and the certificate is still checked for
+ * that name. Any other name, or an IP address, is resolved as usual.
+ * @param {string} hostname The request's host name, as URL gives it.
+ * @returns {{ lookup?: Function }} Options to add to the request.
+ */
+export function addressOptions(hostname) {
+  return hostname === 'localhost' ? { lookup: localhostLookup } : {};
+}
+
+/** dns.lookup's shape, answering only `localhost`, and only with 127.0.0.1. */
+function localhostLookup(hostname, options, callback) {
+  const answer = typeof options === 'function' ? options : callback;
+  const all = typeof options === 'object' && options !== null && options.all === true;
+  if (hostname !== 'localhost') {
+    const error = Object.assign(new Error(`${hostname} is not localhost`), { code: 'ENOTFOUND' });
+    return process.nextTick(answer, error);
+  }
+  if (all) return process.nextTick(answer, null, [{ address: '127.0.0.1', family: 4 }]);
+  return process.nextTick(answer, null, '127.0.0.1', 4);
 }
 
 /**
