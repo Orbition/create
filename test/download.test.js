@@ -12,13 +12,12 @@ import { downloadSource, MAX_ARCHIVE_BYTES, MAX_MANIFEST_BYTES } from '../src/do
 import { install, RETAINED_DIRECTORY } from '../src/install.js';
 import { DESIGN_SYSTEM } from '../src/manifest.js';
 import {
+  certificate,
   entryFor,
   makeProject,
   rebuildElsewhere,
-  run,
   snapshot,
   synthesizeRelease,
-  temporaryDirectory,
 } from './helpers.js';
 
 const VERSION = '0.1.0';
@@ -27,19 +26,6 @@ const RELEASE = `/terminal/design-system/releases/${VERSION}`;
 const CORE = DESIGN_SYSTEM.core;
 const REACT = DESIGN_SYSTEM.renderers.react;
 const QUICK = { manifestMs: 300, archiveMs: 300 };
-
-/** A self-signed certificate for 127.0.0.1, good for these tests only. */
-function certificate() {
-  const directory = temporaryDirectory('tls');
-  const key = path.join(directory, 'key.pem');
-  const cert = path.join(directory, 'cert.pem');
-  run('openssl', [
-    ...['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2'],
-    ...['-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'],
-    ...['-keyout', key, '-out', cert],
-  ]);
-  return { key: readFileSync(key), cert: readFileSync(cert) };
-}
 
 let release;
 let tls;

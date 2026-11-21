@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 
@@ -17,10 +17,18 @@ test('the package would hold the installer and nothing meant for this repository
     'README.md',
     'package.json',
     'src/archive.js',
+    'src/cli.js',
     'src/download.js',
     'src/errors.js',
     'src/install.js',
     'src/manifest.js',
     'src/project.js',
   ]);
+});
+
+test('the package’s one command is the installer, and it can be run directly', () => {
+  const manifest = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+  assert.deepEqual(manifest.bin, { create: 'src/cli.js' });
+  assert.match(readFileSync(path.join(root, 'src/cli.js'), 'utf8'), /^#!\/usr\/bin\/env node\n/);
+  assert.ok(statSync(path.join(root, 'src/cli.js')).mode & 0o100);
 });
