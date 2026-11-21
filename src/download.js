@@ -46,7 +46,7 @@ const MESSAGES = {
 };
 
 /** The archive name the service gives a package: its name without the scope sign, and the version. */
-const archiveName = (name, version) => `${name.replace('@', '').replace('/', '-')}-${version}.tgz`;
+export const archiveName = (name, version) => `${name.replace('@', '').replace('/', '-')}-${version}.tgz`;
 
 /**
  * One GET. `plan(status)` says what an answer with that status may be: its

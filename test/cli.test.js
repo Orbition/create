@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { createServer } from 'node:https';
 import { connect } from 'node:net';
@@ -61,18 +61,27 @@ beforeEach(() => {
 });
 
 /** A terminal for one run: what it shows, and a way to type into it. */
-function terminal() {
-  const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => stdin });
-  const stdout = Object.assign(new PassThrough(), { isTTY: true, columns: 1000 });
+function terminal({ columns = 1000 } = {}) {
+  const stdin = Object.assign(new PassThrough(), {
+    isTTY: true,
+    isRaw: false,
+    setRawMode: (mode) => Object.assign(stdin, { isRaw: mode }),
+  });
+  const stdout = Object.assign(new PassThrough(), { isTTY: true, columns });
   const stderr = new PassThrough();
+  let written = '';
   let shown = '';
   let problems = '';
   // What a person would read: readline's cursor movements left out.
-  stdout.on('data', (chunk) => (shown += String(chunk).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')));
+  stdout.on('data', (chunk) => {
+    written += chunk;
+    shown += String(chunk).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+  });
   stderr.on('data', (chunk) => (problems += chunk));
-  const waitFor = async (pattern) => {
+  /** Waits until `pattern` is shown, looking only past `from` characters of what was shown. */
+  const waitFor = async (pattern, from = 0) => {
     for (let tries = 0; tries < 400; tries += 1) {
-      const found = pattern.exec(shown);
+      const found = pattern.exec(shown.slice(from));
       if (found) return found;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -83,6 +92,10 @@ function terminal() {
     stdout,
     stderr,
     shown: () => shown,
+    /** Everything written, cursor movements included. */
+    written: () => written,
+    /** How much has been shown so far, to wait for what comes after it. */
+    at: () => shown.length,
     problems: () => problems,
     type: (text) => stdin.write(text),
     waitFor,
@@ -167,6 +180,20 @@ function start(term, overrides = {}) {
   return { run, opened, signals };
 }
 
+/**
+ * From the folder's answer on: takes the defaults (Design System, React) and
+ * finishes the preview, each key once its list is shown.
+ */
+async function finishPreview(term) {
+  const from = term.at();
+  await term.waitFor(/What would you like to add\? \(.*\)\n(?:.*\n){3}/, from);
+  term.type('\r');
+  await term.waitFor(/Which do you use\? \(.*\)\n(?:.*\n){2}/, from);
+  term.type('\r');
+  await term.waitFor(/What next\? \(.*\)\n(?:.*\n){3}/, from);
+  term.type('\r');
+}
+
 /** Signs in by hand (no Enter): the run, its terminal and the code the site sent. */
 async function proved(overrides = {}) {
   const term = terminal();
@@ -217,6 +244,7 @@ describe('signing in', () => {
     term.type('missing-folder\r');
     await term.waitFor(/There is no folder at .*missing-folder\./);
     term.type('\r');
+    await finishPreview(term);
     assert.equal(await run, 0);
     assert.match(term.shown(), /  my-app uses pnpm\.\n/);
     assert.match(term.shown(), /Nothing was changed\.\n$/);
@@ -248,6 +276,7 @@ describe('signing in', () => {
     const { term, started } = await proved({ env: { npm_config_user_agent: 'pnpm/10.32.1 node/v24' } });
     await term.waitFor(/Which project folder\?/);
     term.type('\r');
+    await finishPreview(term);
     assert.equal(await started.run, 0);
     assert.deepEqual(started.opened, []);
     assert.doesNotMatch(term.shown(), /Waiting for you to sign in/);
@@ -335,6 +364,7 @@ describe('signing in', () => {
     await signedIn(port, state);
     await term.waitFor(/Which project folder\?/);
     term.type('\r');
+    await finishPreview(term);
     assert.equal(await run, 0);
   });
 
@@ -351,6 +381,7 @@ describe('signing in', () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.doesNotMatch(term.shown(), /uses npm|There is no folder/);
     term.type('\r');
+    await finishPreview(term);
     assert.equal(await run, 0);
     assert.match(term.shown(), /my-app uses npm\./);
   });
@@ -648,7 +679,272 @@ describe('the project folder', () => {
     await term.waitFor(/Which project folder\? \(a path from here; Enter for this one\) $/);
     term.type(`${good}\r`);
     chmodSync(locked, 0o755);
+    await finishPreview(term);
     assert.equal(await started.run, 0);
     assert.match(term.shown(), /good uses npm\./);
+  });
+});
+
+// Keys as a terminal in raw mode sends them.
+const UP = '\x1b[A';
+const DOWN = '\x1b[B';
+
+/** Waits for the list asked with `question` (and its `items` lines) past `from`, then types `keys`. */
+async function inList(term, question, items, keys, from) {
+  await term.waitFor(new RegExp(`${question} \\(.*\\)\\n(?:.*\\n){${String(items)}}`), from);
+  term.type(keys);
+}
+
+/** Signed in, and the folder answered with Enter: the run at the product list, and where it starts. */
+async function atProducts(overrides = {}) {
+  // Started with pnpm, unless a test says otherwise, so the project needs no lockfile.
+  const { term, started } = await proved({ env: { npm_config_user_agent: 'pnpm/10.32.1' }, ...overrides });
+  await term.waitFor(/Which project folder\?.*\) $/);
+  const from = term.at();
+  term.type('\r');
+  await term.waitFor(/What would you like to add\? \(.*\)\n(?:.*\n){3}/, from);
+  return { term, started, from };
+}
+
+describe('choosing what to add, and the review', () => {
+  test('defaults: Design System 0.1.0 and React; the review shows what would change, and Finish changes nothing', async () => {
+    const project = makeProject({ name: 'my-app' });
+    writeFileSync(path.join(project, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
+    const before = snapshot(project);
+    const { term, started, from } = await atProducts({ cwd: project });
+    // Builder and Foundation are shown, and only the Design System can be chosen.
+    assert.match(
+      term.shown().slice(from),
+      /\n    Builder        coming soon\n    Foundation     coming soon\n  ❯ Design System  0\.1\.0\n/,
+    );
+    // Up and Down cannot reach what is coming soon.
+    term.type(UP);
+    term.type(DOWN);
+    term.type('\r');
+    await inList(term, 'Which do you use\\?', 2, '', from);
+    assert.match(term.shown().slice(from), /What would you like to add\? Design System 0\.1\.0\n/);
+    assert.match(term.shown().slice(from), /  ❯ \[x\] React\n    \[ \] Web Components \(plain HTML\)\n/);
+    term.type('\r');
+    await term.waitFor(/What next\? \(.*\)\n(?:.*\n){3}/, from);
+    const review = term.shown().slice(from);
+    assert.match(review, /Which do you use\? React\n/);
+    const directory = realpathSync(project);
+    assert.ok(
+      review.includes(
+        [
+          'Review',
+          '  Project    my-app (pnpm)',
+          `             ${directory}`,
+          '  Adding     Design System 0.1.0: Core and React',
+          '  Packages   @orbition/design-system-core 0.1.0',
+          '             @orbition/design-system-react 0.1.0',
+          '  Changes    vendor/orbition/orbition-design-system-core-0.1.0.tgz',
+          '             vendor/orbition/orbition-design-system-react-0.1.0.tgz',
+          '             (the archive names the release is expected to give)',
+          '             package.json and pnpm-lock.yaml',
+          '  Then       pnpm install',
+          "             which can also run install scripts of the project's other dependencies.",
+          '',
+          'What next? (Up/Down to move, Enter to choose)',
+          '  ❯ Finish the preview  approval and download are not built yet',
+          '    Change selections',
+          '    Cancel',
+        ].join('\n'),
+      ),
+      review,
+    );
+    term.type('\r');
+    assert.equal(await started.run, 0);
+    assert.match(term.shown(), /What next\? Finish the preview\.\n\nThat is as far as this version goes/);
+    assert.match(term.shown(), /Nothing was changed\.\n$/);
+    assert.deepEqual(snapshot(project), before);
+    // Only the one proof; the terminal is left out of raw mode.
+    assert.equal(proofs.length, 1);
+    assert.equal(term.stdin.isRaw, false);
+  });
+
+  test('both renderers: Core once, then React and Web Components; npm names its own lockfile', async () => {
+    const { term, started, from } = await atProducts({ env: { npm_config_user_agent: 'npm/11.0.0' } });
+    term.type('\r');
+    await inList(term, 'Which do you use\\?', 2, DOWN, from);
+    await term.waitFor(/  ❯ \[ \] Web Components/, from);
+    term.type(' ');
+    await term.waitFor(/  ❯ \[x\] Web Components/, from);
+    term.type('\r');
+    await term.waitFor(/What next\? \(.*\)\n(?:.*\n){3}/, from);
+    const review = term.shown().slice(from);
+    assert.match(review, /Which do you use\? React and Web Components \(plain HTML\)\n/);
+    assert.match(review, /Adding     Design System 0\.1\.0: Core, React and Web Components\n/);
+    assert.equal(review.match(/design-system-core/g).length, 2); // one package, one archive
+    assert.match(
+      review,
+      /Packages   @orbition\/design-system-core 0\.1\.0\n {13}@orbition\/design-system-react 0\.1\.0\n {13}@orbition\/design-system-web-components 0\.1\.0\n/,
+    );
+    assert.match(
+      review,
+      /orbition-design-system-web-components-0\.1\.0\.tgz\n {13}\(the archive names the release is expected to give\)\n {13}package\.json and package-lock\.json\n  Then       npm install\n/,
+    );
+    term.type('\r');
+    assert.equal(await started.run, 0);
+  });
+
+  test('at least one renderer: none marked is refused, and Web Components alone is enough', async () => {
+    const { term, started, from } = await atProducts();
+    term.type('\r');
+    await inList(term, 'Which do you use\\?', 2, ' ', from);
+    await term.waitFor(/  ❯ \[ \] React/, from);
+    term.type('\r');
+    await term.waitFor(/Choose at least one: Space marks the one under ❯\./, from);
+    assert.doesNotMatch(term.shown().slice(from), /Review/);
+    term.type(DOWN);
+    term.type(' ');
+    await term.waitFor(/  ❯ \[x\] Web Components/, from);
+    term.type('\r');
+    await term.waitFor(/What next\? \(.*\)\n(?:.*\n){3}/, from);
+    const review = term.shown().slice(from);
+    assert.match(review, /Which do you use\? Web Components \(plain HTML\)\n/);
+    assert.match(review, /Adding     Design System 0\.1\.0: Core and Web Components\n/);
+    assert.doesNotMatch(review, /design-system-react/);
+    term.type('\r');
+    assert.equal(await started.run, 0);
+  });
+
+  test('Change selections asks again from the last answers, without signing in again', async () => {
+    const { term, started, from } = await atProducts();
+    term.type('\r');
+    await inList(term, 'Which do you use\\?', 2, `${DOWN} `, from);
+    await term.waitFor(/  ❯ \[x\] Web Components/, from);
+    term.type('\r');
+    await inList(term, 'What next\\?', 3, DOWN, from);
+    await term.waitFor(/  ❯ Change selections/, from);
+    const again = term.at();
+    term.type('\r');
+    await inList(term, 'What would you like to add\\?', 3, '\r', again);
+    // Both still marked, as last answered: unmark React.
+    await inList(term, 'Which do you use\\?', 2, '', again);
+    assert.match(term.shown().slice(again), /  ❯ \[x\] React\n    \[x\] Web Components/);
+    term.type(' ');
+    await term.waitFor(/  ❯ \[ \] React/, again);
+    term.type('\r');
+    await inList(term, 'What next\\?', 3, '\r', again);
+    assert.equal(await started.run, 0);
+    const second = term.shown().slice(again);
+    assert.match(second, /Adding     Design System 0\.1\.0: Core and Web Components\n/);
+    // One sign-in link, one proof, no browser opened again.
+    assert.equal(term.shown().match(/\/terminal\/sign-in\?/g).length, 1);
+    assert.equal(proofs.length, 1);
+    assert.equal(term.shown().match(/Which project folder\?/g).length, 1);
+  });
+
+  test('Cancel stops with nothing changed', async () => {
+    const project = makeProject({ name: 'my-app', packageManager: 'npm@11.0.0' });
+    const before = snapshot(project);
+    const { term, started, from } = await atProducts({ cwd: project });
+    term.type('\r');
+    await inList(term, 'Which do you use\\?', 2, '\r', from);
+    await inList(term, 'What next\\?', 3, `${UP}`, from);
+    await term.waitFor(/  ❯ Cancel/, from);
+    term.type('\r');
+    assert.equal(await started.run, 1);
+    assert.match(term.shown(), /What next\? Cancel\.\n$/);
+    assert.equal(term.problems(), 'Cancelled. Nothing was changed.\n');
+    assert.deepEqual(snapshot(project), before);
+    assert.equal(term.stdin.isRaw, false);
+  });
+
+  test('Ctrl+C, the process interrupt, Ctrl+D and the input ending each stop the run at a list', async () => {
+    // Ctrl+C as the raw terminal sends it, at each list.
+    for (const [question, items, before] of [
+      ['What would you like to add\\?', 3, ''],
+      ['Which do you use\\?', 2, '\r'],
+      ['What next\\?', 3, '\r\r'],
+    ]) {
+      const { term, started, from } = await atProducts();
+      for (const key of before) {
+        const at = term.at();
+        term.type(key);
+        await term.waitFor(/\? [A-Z].*\n/, at);
+      }
+      await inList(term, question, items, '\x03', from);
+      assert.equal(await started.run, 130, question);
+      assert.match(term.shown(), /\nStopped\. Nothing was changed\.\n$/);
+      assert.equal(term.stdin.isRaw, false);
+      assert.equal(started.signals.listenerCount('SIGINT'), 0);
+    }
+    // The process's own interrupt.
+    let { term, started } = await atProducts();
+    started.signals.emit('SIGINT');
+    assert.equal(await started.run, 130);
+    assert.equal(term.stdin.isRaw, false);
+    // Ctrl+D.
+    ({ term, started } = await atProducts());
+    term.type('\x04');
+    assert.equal(await started.run, 1);
+    assert.match(term.problems(), /No answer: the input ended\. Nothing was changed\./);
+    assert.equal(term.stdin.isRaw, false);
+    // The input ending.
+    ({ term, started } = await atProducts());
+    term.stdin.end();
+    assert.equal(await started.run, 1);
+    assert.match(term.problems(), /No answer: the input ended\. Nothing was changed\./);
+    assert.equal(term.stdin.isRaw, false);
+  });
+
+  test('a project name or folder with control characters is shown as plain text', async () => {
+    const parent = temporaryDirectory('odd');
+    const project = path.join(parent, 'dir\x1b[31mred\u202e');
+    mkdirSync(project);
+    writeFileSync(
+      path.join(project, 'package.json'),
+      JSON.stringify({ name: 'evil\x1b[2J\r\n  ❯ Cancel\u2028x', packageManager: 'npm@11.0.0' }),
+    );
+    const { term, started, from } = await atProducts({ cwd: project });
+    term.type('\r');
+    await inList(term, 'Which do you use\\?', 2, '\r', from);
+    await inList(term, 'What next\\?', 3, '', from);
+    const written = term.written();
+    for (const raw of ['\x1b[2J', '\x1b[31m', '\r\n  ❯ Cancel', '\u2028', '\u202e']) {
+      assert.ok(!written.includes(raw), JSON.stringify(raw));
+    }
+    assert.match(term.shown(), /evil\\u001b\[2J\\u000d\\u000a  ❯ Cancel\\u2028x uses npm\./);
+    assert.match(
+      term.shown().slice(from),
+      /  Project    evil\\u001b\[2J\\u000d\\u000a  ❯ Cancel\\u2028x \(npm\)\n {13}.*dir\\u001b\[31mred\\u202e\n/,
+    );
+    // The choices read as they should: Finish is still the first.
+    assert.match(term.shown().slice(from), /What next\? \(.*\)\n  ❯ Finish the preview/);
+    term.type('\r');
+    assert.equal(await started.run, 0);
+  });
+
+  test('on a narrow terminal, each redraw goes back over every row the list took', async () => {
+    const columns = 20;
+    const term = terminal({ columns });
+    const started = start(term, { env: { npm_config_user_agent: 'pnpm/10.32.1' } });
+    const { port, state } = await term.link();
+    await signedIn(port, state);
+    await term.waitFor(/Which project folder\?.*\) $/);
+    term.type('\r');
+    await term.waitFor(/  ❯ Design System  0\.1\.0\n/);
+    term.type('\r');
+    await term.waitFor(/Which do you use\? \(.*\)\n(?:.*\n){2}/);
+    const before = term.written().length;
+    term.type(DOWN);
+    await term.waitFor(/  ❯ \[ \] Web Components/);
+    // The frame before Down, and the move back up over it.
+    const written = term.written();
+    const frame = written.slice(written.lastIndexOf('Which do you use? (', before), before);
+    // 62 characters take 4 rows at 20 columns, 13 take 1, and 35 take 2: 7 rows.
+    assert.deepEqual(
+      frame.split('\n').map((line) => [...line].length),
+      [62, 13, 35, 0],
+    );
+    assert.ok(
+      written.slice(before).startsWith('\x1b[7A'),
+      JSON.stringify(written.slice(before, before + 12)),
+    );
+    term.type('\r');
+    await inList(term, 'What next\\?', 3, '\r', term.at());
+    assert.equal(await started.run, 0);
   });
 });
