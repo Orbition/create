@@ -15,7 +15,7 @@ import path from 'node:path';
 
 import { readPackedManifest, verifyArchive } from './archive.js';
 import { InstallError } from './errors.js';
-import { packageNames, selectPackages, validateManifest } from './manifest.js';
+import { archiveName, packageNames, selectPackages, validateManifest } from './manifest.js';
 import {
   declaredDependency,
   detectPackageManager,
@@ -77,8 +77,16 @@ const RETAINED_DEPENDENCY = new RegExp(
  * @param {string[]} options.renderers `react`, `web-components`, or both.
  * @param {string} [options.invokedBy] The package manager the installer was
  *   started with, used when the project does not say which it uses.
+ * @param {'npm' | 'pnpm'} [options.packageManager] The package manager the
+ *   person was shown. If the project now says another, nothing is fetched or
+ *   written.
+ * @param {(result: object) => Promise<void>} [options.whileLocked] Runs after
+ *   a successful install, while this installer still holds the project (to
+ *   run the project's own install, say), so no other installer can start in
+ *   between. A failure there is its own: the project stays as the install
+ *   left it, and the lock is let go either way.
  */
-export async function install({ project, source, renderers, invokedBy }) {
+export async function install({ project, source, renderers, invokedBy, packageManager, whileLocked }) {
   const names = selectPackages(renderers);
   const entries = validateManifest(source.manifest);
   const { version } = source.manifest;
@@ -92,7 +100,17 @@ export async function install({ project, source, renderers, invokedBy }) {
   requireManifestFile(directory);
   const unlock = lock(directory);
   try {
-    return await installLocked({ directory, source, entries, names, version, invokedBy });
+    const result = await installLocked({
+      directory,
+      source,
+      entries,
+      names,
+      version,
+      invokedBy,
+      expected: packageManager,
+    });
+    await whileLocked?.(result);
+    return result;
   } finally {
     unlock();
   }
@@ -153,8 +171,59 @@ export function checkProject(directory, invokedBy) {
   return { project, packageManager, lockfile, lockfilePath };
 }
 
-async function installLocked({ directory, source, entries, names, version, invokedBy }) {
+/**
+ * What can be known about a project before a release is downloaded for it,
+ * without the release, as `install` would judge it: everything
+ * `checkProject` checks, no install lock in it, and every Design System
+ * package it already declares declared as this installer declares this
+ * release's (in `dependencies`, as the retained archive of this version).
+ * A declared package that is not asked for now must have its archive there;
+ * one asked for is downloaded again if it is missing, as `install` does.
+ * Reads only. `install` checks all of it again, and the archives themselves,
+ * before it writes.
+ *
+ * @param {string} directory
+ * @param {string | undefined} invokedBy
+ * @param {string} version
+ * @param {string[]} renderers The renderers asked for now.
+ */
+export function checkBeforeInstall(directory, invokedBy, version, renderers) {
+  const asked = selectPackages(renderers);
+  const checked = checkProject(directory, invokedBy);
+  if (kindOf(path.join(directory, INSTALL_LOCK)) !== 'missing') {
+    throw new InstallError(
+      `Another installer is working in this project, or one stopped before it finished: ${INSTALL_LOCK} is there. If none is running, delete that file and run this again.`,
+    );
+  }
+  for (const name of packageNames()) {
+    const declared = declaredDependency(checked.project.manifest, name);
+    if (!declared) continue;
+    const expected = archiveName(name, version);
+    const file =
+      declared.field === 'dependencies' && typeof declared.spec === 'string'
+        ? RETAINED_DEPENDENCY.exec(declared.spec)?.[1]
+        : undefined;
+    if (file !== expected) {
+      throw new InstallError(
+        `This project already declares ${name} in ${declared.field} as ${JSON.stringify(declared.spec)}. This release is ${version}, and replacing an installed version is not supported yet.`,
+      );
+    }
+    if (!asked.includes(name) && kindOf(path.join(directory, ...RETAINED_DIRECTORY.split('/'), file)) !== 'file') {
+      throw new InstallError(
+        `This project declares ${name}, but ${RETAINED_DIRECTORY}/${file} is not in it. Restore that file, then run this again.`,
+      );
+    }
+  }
+  return checked;
+}
+
+async function installLocked({ directory, source, entries, names, version, invokedBy, expected }) {
   const { project, packageManager, lockfile, lockfilePath } = checkProject(directory, invokedBy);
+  if (expected !== undefined && packageManager !== expected) {
+    throw new InstallError(
+      `This project now uses ${packageManager}, not ${expected} as it did when it was reviewed. Nothing was changed: run the installer again to review it.`,
+    );
+  }
   const segments = RETAINED_DIRECTORY.split('/');
   const retainedPath = (file) => path.join(directory, ...segments, file);
 
@@ -232,6 +301,17 @@ async function installLocked({ directory, source, entries, names, version, invok
   // credential lets it go here, before anything is written or started.
   source.close?.();
 
+  // The downloads take time: the project must still be as it was read, and
+  // use the same package manager, or nothing is written.
+  const now = checkProject(directory, invokedBy);
+  if (now.packageManager !== packageManager || now.project.text !== project.text) {
+    throw new InstallError(
+      now.packageManager !== packageManager
+        ? `This project now uses ${now.packageManager}, not ${packageManager}: it changed while the release was downloaded. Nothing was changed: run the installer again to review it.`
+        : 'package.json changed while the release was downloaded. Nothing was changed: run the installer again.',
+    );
+  }
+
   // The two files this run may replace, as they are now: what a failure puts
   // back, permissions included.
   const manifestBefore = { contents: project.text, mode: modeOf(project.manifestPath) };
@@ -304,7 +384,11 @@ async function installLocked({ directory, source, entries, names, version, invok
       encoding: 'utf8',
       shell: process.platform === 'win32',
     });
-    if (interrupted) throw new InstallError('Interrupted.');
+    // Ctrl+C reaches the package manager in the same terminal, and this
+    // process's handler only after it ended: an end by signal is one too.
+    if (interrupted || update.signal) {
+      throw Object.assign(new InstallError('Interrupted.'), { interrupted: true });
+    }
     if (update.error || update.status !== 0) {
       const output = update.error?.message ?? `${update.stdout}${update.stderr}`.trim();
       throw new InstallError(`${packageManager} could not update ${lockfile}:\n\n${output}`);
@@ -334,13 +418,17 @@ async function installLocked({ directory, source, entries, names, version, invok
         else rmdirSync(made);
       }
     } catch (undoError) {
-      throw new InstallError(
-        `${error.message}\n\nThe project could then not be put back as it was (${undoError.message}). Check package.json, ${lockfile} and ${RETAINED_DIRECTORY} before going on.`,
+      // `projectState` says what became of the project: `unknown` here.
+      throw Object.assign(
+        new InstallError(
+          `${error.message}\n\nThe project could then not be put back as it was (${undoError.message}). Check package.json, ${lockfile} and ${RETAINED_DIRECTORY} before going on.`,
+        ),
+        { projectState: 'unknown' },
       );
     }
-    if (error instanceof InstallError) {
-      error.message += '\n\nThe project was put back as it was.';
-    }
+    // Whatever the failure, the project was put back: `projectState` says so.
+    if (error instanceof InstallError) error.message += '\n\nThe project was put back as it was.';
+    if (error !== null && typeof error === 'object') error.projectState = 'restored';
     throw error;
   } finally {
     process.off('SIGINT', onSignal);

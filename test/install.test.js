@@ -12,7 +12,7 @@ import {
 import path from 'node:path';
 import { before, describe, test } from 'node:test';
 
-import { install, INSTALL_LOCK, RETAINED_DIRECTORY } from '../src/install.js';
+import { checkBeforeInstall, install, INSTALL_LOCK, RETAINED_DIRECTORY } from '../src/install.js';
 import { DESIGN_SYSTEM } from '../src/manifest.js';
 import {
   alter,
@@ -719,5 +719,164 @@ describe('what it tells the person', () => {
       result.warnings[0],
       /^Git ignores vendor\/orbition\/.*core-1\.0\.0\.tgz and .*react-1\.0\.0\.tgz\./,
     );
+  });
+});
+
+describe('for the command: the reviewed package manager, the project held after, and a check before the download', () => {
+  test('a project that now says another package manager than the one asked for is not written', async () => {
+    const project = makeProject({ packageManager: 'npm@11.0.0' });
+    writeFileSync(path.join(project, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
+    let read = 0;
+    const counting = { ...release, read: (file) => (read += 1) && release.read(file) };
+    await refuses(
+      project,
+      { source: counting, renderers: ['react'], packageManager: 'npm' },
+      /^This project now uses pnpm, not npm as it did when it was reviewed\. Nothing was changed: run the installer again to review it\.$/,
+    );
+    assert.equal(read, 0);
+    assert.equal(existsSync(path.join(project, INSTALL_LOCK)), false);
+  });
+
+  test('whileLocked runs after the install with the project still held, and the hold ends however it ends', async () => {
+    const project = makeProject({ packageManager: 'npm@11.0.0' });
+    let held;
+    const result = await install({
+      project,
+      source: release,
+      renderers: ['react'],
+      packageManager: 'npm',
+      whileLocked: async (seen) => {
+        held = existsSync(path.join(project, INSTALL_LOCK));
+        assert.equal(seen.packageManager, 'npm');
+        // Another installer cannot start meanwhile.
+        await assert.rejects(install({ project, source: release, renderers: ['react'] }), /Another installer is working in this project/);
+      },
+    });
+    assert.equal(held, true);
+    assert.equal(result.packageManager, 'npm');
+    assert.equal(existsSync(path.join(project, INSTALL_LOCK)), false);
+
+    // Its failure is its own: the install stays, and the hold ends.
+    const declared = readManifest(project);
+    await assert.rejects(
+      install({
+        project,
+        source: release,
+        renderers: ['react'],
+        whileLocked: async () => {
+          throw new Error('the project install failed');
+        },
+      }),
+      /the project install failed/,
+    );
+    assert.deepEqual(readManifest(project), declared);
+    assert.equal(existsSync(path.join(project, INSTALL_LOCK)), false);
+  });
+
+  test('before the download: what the install would refuse without the release, read only', async () => {
+    const project = makeProject({ packageManager: 'pnpm@10.0.0' });
+    assert.equal(checkBeforeInstall(project, undefined, '1.0.0', ['react']).packageManager, 'pnpm');
+    const before = snapshot(project);
+    // Another version declared.
+    const other = makeProject({ dependencies: { [REACT]: 'file:vendor/orbition/orbition-design-system-react-0.9.0.tgz' } });
+    assert.throws(() => checkBeforeInstall(other, 'npm', '1.0.0', ['react']), /already declares @orbition\/design-system-react in dependencies/);
+    // A declared archive that is missing: asked for now, it is downloaded
+    // again, as install does; not asked for, it must be restored.
+    const missing = makeProject({
+      dependencies: {
+        [CORE]: 'file:vendor/orbition/orbition-design-system-core-1.0.0.tgz',
+        [REACT]: 'file:vendor/orbition/orbition-design-system-react-1.0.0.tgz',
+      },
+    });
+    assert.equal(checkBeforeInstall(missing, 'npm', '1.0.0', ['react']).packageManager, 'npm');
+    assert.throws(
+      () => checkBeforeInstall(missing, 'npm', '1.0.0', ['web-components']),
+      /declares @orbition\/design-system-react, but vendor\/orbition\/orbition-design-system-react-1\.0\.0\.tgz is not in it/,
+    );
+    // And install agrees: it puts the missing archives back.
+    await install({ project: missing, source: release, renderers: ['react'], invokedBy: 'npm' });
+    assert.ok(existsSync(path.join(missing, retained(release, 'react'))));
+    writeFileSync(path.join(project, INSTALL_LOCK), '');
+    assert.throws(() => checkBeforeInstall(project, undefined, '1.0.0', ['react']), /Another installer is working in this project/);
+    rmSync(path.join(project, INSTALL_LOCK));
+    assert.deepEqual(snapshot(project), before);
+  });
+
+  test('a project that changes while the release is downloaded is not written', async () => {
+    // Its package manager.
+    let project = makeProject({ packageManager: 'npm@11.0.0' });
+    const changing = (change) => ({
+      ...release,
+      read: (file) => {
+        change();
+        return release.read(file);
+      },
+    });
+    let lockfile = path.join(project, 'pnpm-lock.yaml');
+    const unchanged = (directory) => {
+      const files = snapshot(directory);
+      delete files['pnpm-lock.yaml'];
+      delete files['package.json'];
+      return files;
+    };
+    let before = unchanged(project);
+    await assert.rejects(
+      install({ project, source: changing(() => writeFileSync(lockfile, "lockfileVersion: '9.0'\n")), renderers: ['react'], packageManager: 'npm' }),
+      /^InstallError: This project now uses pnpm, not npm: it changed while the release was downloaded\. Nothing was changed: run the installer again to review it\.$/,
+    );
+    assert.deepEqual(unchanged(project), before);
+    assert.equal(existsSync(path.join(project, RETAINED_DIRECTORY)), false);
+
+    // Its package.json: never written over an edit made meanwhile.
+    project = makeProject({ packageManager: 'npm@11.0.0' });
+    const manifestPath = path.join(project, 'package.json');
+    await assert.rejects(
+      install({
+        project,
+        source: changing(() => writeFileSync(manifestPath, JSON.stringify({ name: 'edited', packageManager: 'npm@11.0.0' }))),
+        renderers: ['react'],
+      }),
+      /package\.json changed while the release was downloaded\. Nothing was changed/,
+    );
+    assert.equal(readManifest(project).name, 'edited');
+    assert.equal(existsSync(path.join(project, RETAINED_DIRECTORY)), false);
+  });
+
+  test('any failure once writing began is marked as put back: a raw file system error too', async () => {
+    const project = makeProject({ packageManager: 'npm@11.0.0' });
+    mkdirSync(path.join(project, 'vendor'));
+    chmodSync(path.join(project, 'vendor'), 0o555);
+    const before = snapshot(project);
+    try {
+      await assert.rejects(install({ project, source: release, renderers: ['react'] }), (error) => {
+        assert.equal(error.code, 'EACCES');
+        assert.equal(error.projectState, 'restored');
+        return true;
+      });
+      assert.deepEqual(snapshot(project), before);
+    } finally {
+      chmodSync(path.join(project, 'vendor'), 0o755);
+    }
+  });
+
+  test('npm ended by Ctrl+C while it updates the lockfile is an interruption, and the project is put back', async () => {
+    const bin = temporaryDirectory('interrupted-npm');
+    writeFileSync(path.join(bin, 'npm'), '#!/bin/sh\nkill -INT $$\n');
+    chmodSync(path.join(bin, 'npm'), 0o755);
+    const project = makeProject({ packageManager: 'npm@11.0.0' });
+    const before = snapshot(project);
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:${saved}`;
+    try {
+      await assert.rejects(install({ project, source: release, renderers: ['react'] }), (error) => {
+        assert.equal(error.interrupted, true);
+        assert.equal(error.projectState, 'restored');
+        assert.match(error.message, /^Interrupted\.\n\nThe project was put back as it was\.$/);
+        return true;
+      });
+    } finally {
+      process.env.PATH = saved;
+    }
+    assert.deepEqual(snapshot(project), before);
   });
 });

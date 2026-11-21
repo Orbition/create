@@ -1,8 +1,7 @@
 // What the person can choose to add, and what adding it would change, for the
 // review. Nothing here reads the network or writes a file.
-import { archiveName } from './download.js';
 import { RETAINED_DIRECTORY } from './install.js';
-import { DESIGN_SYSTEM, selectPackages } from './manifest.js';
+import { archiveName, DESIGN_SYSTEM, selectPackages } from './manifest.js';
 import { LOCKFILES } from './project.js';
 
 /** The Design System release this installer offers; the first proof names it explicitly. */

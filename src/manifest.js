@@ -126,5 +126,8 @@ export function selectPackages(renderers) {
   ];
 }
 
+/** The archive name the service gives a package: its name without the scope sign, and the version. */
+export const archiveName = (name, version) => `${name.replace('@', '').replace('/', '-')}-${version}.tgz`;
+
 /** Every Design System package name, core first. */
 export const packageNames = () => [...NAMES];

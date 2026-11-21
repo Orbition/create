@@ -2,7 +2,7 @@ import { request } from 'node:https';
 import { createGunzip } from 'node:zlib';
 
 import { InstallError } from './errors.js';
-import { DESIGN_SYSTEM, validateManifest } from './manifest.js';
+import { archiveName, DESIGN_SYSTEM, validateManifest } from './manifest.js';
 
 /** The most a release manifest, or a refusal, may weigh once decoded. */
 export const MAX_MANIFEST_BYTES = 64 * 1024;
@@ -38,15 +38,12 @@ const unavailable = (what) => refusal('unavailable', `${what} Try again in a few
 
 const MESSAGES = {
   sign_in_required: () =>
-    'This download is no longer approved: the approval ended, or the account signed out. Run the installer again to approve it.',
+    'This download is no longer allowed: its permission ended, or the browser signed out. Run the installer again to allow it.',
   not_entitled: () => 'This account has no current access to the Design System.',
   access_denied: () =>
     'This account cannot download yet. Finish setting the account up on the Orbition site, then run the installer again.',
   not_found: (what) => `${what} was not found.`,
 };
-
-/** The archive name the service gives a package: its name without the scope sign, and the version. */
-export const archiveName = (name, version) => `${name.replace('@', '').replace('/', '-')}-${version}.tgz`;
 
 /**
  * One GET. `plan(status)` says what an answer with that status may be: its
@@ -58,13 +55,13 @@ export const archiveName = (name, version) => `${name.replace('@', '').replace('
  * answer the installer reads (status, media type, compression, or a refusal
  * whose body did not arrive). Rejects when no answer arrived whole: no
  * connection, a certificate that is not trusted, a broken connection, or the
- * time limit.
+ * time limit, or `signal` aborting (with its reason).
  *
  * Redirects are never followed, only gzip or no compression is read, the
  * certificate is always checked whatever the environment says, and once the
  * outcome is known nothing is left reading or decoding.
  */
-function get({ url, credential, ca, timeoutMs, plan }) {
+function get({ url, credential, ca, timeoutMs, plan, signal }) {
   return new Promise((resolve, reject) => {
     let incoming;
     let gunzip;
@@ -85,7 +82,9 @@ function get({ url, credential, ca, timeoutMs, plan }) {
         agent: false,
         ca,
         rejectUnauthorized: true,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+          : AbortSignal.timeout(timeoutMs),
         headers: { Authorization: `Bearer ${credential}`, 'Accept-Encoding': 'gzip' },
       },
       (response) => {
@@ -131,9 +130,10 @@ function get({ url, credential, ca, timeoutMs, plan }) {
  * One request to the service, read as its contract says. Returns the decoded
  * body of a `200` with the expected media type, or `overflow` when it was
  * longer than `maxBytes`. Every other answer is a refusal. A passing fault (no
- * answer, or `503`) is tried once more; nothing else is ever tried twice.
+ * answer, or `503`) is tried once more; nothing else is ever tried twice, and
+ * once `signal` aborts nothing is tried again: its reason is thrown.
  */
-async function ask({ url, expect, what, credential, ca, timeoutMs, maxBytes }) {
+async function ask({ url, expect, what, credential, ca, timeoutMs, maxBytes, signal }) {
   const unexpected = () =>
     unavailable('The download service gave an answer this installer does not understand.');
   const plan = (status) => {
@@ -144,8 +144,9 @@ async function ask({ url, expect, what, credential, ca, timeoutMs, maxBytes }) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let answer;
     try {
-      answer = await get({ url, credential, ca, timeoutMs, plan });
+      answer = await get({ url, credential, ca, timeoutMs, plan, signal });
     } catch (error) {
+      if (signal?.aborted) throw signal.reason;
       if (NOT_TRUSTED.test(`${error.code} ${error.message}`)) {
         throw unavailable("The download service's certificate could not be verified.");
       }
@@ -198,9 +199,11 @@ async function ask({ url, expect, what, credential, ca, timeoutMs, maxBytes }) {
  *   trust, for a rehearsal or test server that has its own. The certificate
  *   is checked either way.
  * @param {{ manifestMs: number, archiveMs: number }} [options.limits]
+ * @param {AbortSignal} [options.signal] Stops every request, now and later:
+ *   whatever is in progress or asked for next rejects with its reason.
  * @returns {Promise<{ manifest: object, read: (file: string) => Promise<Buffer>, close: () => void }>}
  */
-export async function downloadSource({ origin, version, credential, ca, limits = LIMITS }) {
+export async function downloadSource({ origin, version, credential, ca, limits = LIMITS, signal }) {
   let base;
   try {
     base = new URL(origin);
@@ -232,6 +235,7 @@ export async function downloadSource({ origin, version, credential, ca, limits =
     ca,
     timeoutMs: limits.manifestMs,
     maxBytes: MAX_MANIFEST_BYTES,
+    signal,
   });
   if (listed.overflow) throw invalid('is larger than a manifest can be.');
   let manifest;
@@ -270,6 +274,7 @@ export async function downloadSource({ origin, version, credential, ca, limits =
         ca,
         timeoutMs: limits.archiveMs,
         maxBytes: entry.bytes,
+        signal,
       });
       if (overflow || body.length !== entry.bytes) {
         throw refusal(
