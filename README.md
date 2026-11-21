@@ -16,13 +16,27 @@ to the project and runs the project's own install. Nothing in the project
 changes, and nothing is downloaded, before you choose Install.
 
 Until the Orbition site's address is confirmed, the command works only with a
-local test site, `https://127.0.0.1:<port>` (a port other than 443), and only
-with that site's certificate authority given explicitly, as a PEM file holding
-exactly one certificate. Give the site with `--origin` or
+local test site, `https://127.0.0.1:<port>` (a port other than 443) or exactly
+`https://localhost:8443` (the local app, as a local Caddy setup serves it), and
+only with that site's certificate authority given explicitly, as a PEM file
+holding exactly one certificate. Give the site with `--origin` or
 `ORBITION_ORIGIN`, and the authority's PEM file with `--ca` or `ORBITION_CA`
 (each flag wins over its variable). That file is the only authority trusted
-for the site, and the site's certificate is always checked. Any other site is
+for the site, and the site's certificate chain and name are always checked,
+for the check, the exchange and every download alike. Any other site is
 refused. The command shows which site it uses before the browser is opened.
+
+For `https://localhost:8443` the command connects to `127.0.0.1` itself, never
+asking a resolver or the hosts file, so a local app that listens on IPv4 only
+is reached even where `localhost` would first mean `::1`. The connection still
+names `localhost` to the server, and the certificate must be for `localhost`
+and chain to the authority given: for a Caddy setup's own local authority,
+its root certificate. The browser is sent to
+`https://localhost:8443/terminal/approve?…`; the site's answer still comes
+back only to this command's listener at `http://127.0.0.1:<port>`, with the
+request's own state and PKCE verifier, as with any site. The local app has
+to answer at that address with the install permission and its check, as the
+local test site below does.
 
 To try it against the application's local test site (a test-only build with
 an in-memory provider and synthetic accounts, from an Orbition application
@@ -71,8 +85,9 @@ node /path/to/create/src/cli.js
 ```
 
 Press Enter to open the browser, sign in, and choose **Allow** (or
-**Cancel**; without access, **Let the terminal know** or **Cancel**). Use `127.0.0.1`, not `localhost`: the site sends the browser to
-its own configured address. The browser warns about the self-signed
+**Cancel**; without access, **Let the terminal know** or **Cancel**). With that local test site, use
+`127.0.0.1`, not `localhost`: the site sends the browser to its own configured
+address. The browser warns about the self-signed
 certificate until you accept it. Then answer the folder question;
 Enter takes the current folder.
 

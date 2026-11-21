@@ -23,7 +23,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { after, before, beforeEach, describe, test } from 'node:test';
 
-import { APPROVAL_MS, CONSENT_MARGIN_MS, EXCHANGE_MS, main, VERIFY_MS } from '../src/cli.js';
+import { APPROVAL_MS, CONSENT_MARGIN_MS, EXCHANGE_MS, LOCAL_APP_ORIGIN, main, VERIFY_MS } from '../src/cli.js';
 import { INSTALL_LOCK } from '../src/install.js';
 import {
   certificate,
@@ -418,6 +418,55 @@ describe('signing in and allowing the install, in one browser visit', () => {
     assert.equal(checks.length, 0);
   });
 
+  test('with the local app at https://localhost:8443 the browser goes there, and its answer still comes only to 127.0.0.1', async () => {
+    // Nothing is sent to port 8443 here: the run is cancelled in the browser.
+    const term = terminal();
+    const { run, opened, signals } = start(term, { argv: ['--origin', LOCAL_APP_ORIGIN, '--ca', CA] });
+    let ended = false;
+    run.finally(() => (ended = true)).catch(() => {});
+    try {
+      await term.waitFor(/Signing in on https:\/\/localhost:8443 \(from --origin\)\./);
+      const [link, challenge, state, port] = await term.waitFor(
+        /https:\/\/localhost:8443\/terminal\/approve\?product=design-system&version=0\.1\.0&purpose=install&code_challenge=([A-Za-z0-9_-]{43})&code_challenge_method=S256&state=([A-Za-z0-9_-]{43})&port=(\d+)(?=\n)/,
+      );
+      assert.ok(challenge && state);
+      term.type('\r');
+      await term.waitFor(/Waiting for you to sign in and allow it/);
+      assert.deepEqual(opened, [link]);
+
+      // The listener is on 127.0.0.1 only, at the port the link names, and
+      // answers only requests addressed to 127.0.0.1 with this request's state.
+      const v6 = await new Promise((resolve) => {
+        const socket = connect(Number(port), '::1');
+        socket.on('connect', () => {
+          socket.destroy();
+          resolve('connected');
+        });
+        socket.on('error', (error) => resolve(error.code));
+      });
+      assert.notEqual(v6, 'connected');
+      const named = await visit(Number(port), `/callback?state=${state}&error=cancelled`, {
+        host: `localhost:${port}`,
+      });
+      assert.equal(named.status, 400);
+      const otherState = await answer(Number(port), 'A'.repeat(43), 'error=cancelled');
+      assert.equal(otherState.status, 400);
+
+      const page = await answer(Number(port), state, 'error=cancelled');
+      assert.match(page.body, /Cancelled/);
+      assert.equal(await run, 1);
+      assert.match(term.problems(), /^It was cancelled in the browser\. Nothing was changed\.\n$/);
+      assert.equal(await closed(Number(port)), true);
+      assert.deepEqual([checks.length, exchanges.length, fetches.length, others.length], [0, 0, 0, 0]);
+    } finally {
+      // Should an assertion fail first, stop the run so its listener is not left waiting.
+      if (!ended) {
+        signals.emit('SIGINT');
+        await run.catch(() => {});
+      }
+    }
+  });
+
   test('ran out of time, no access, an account not ready or no such release in the browser: the run ends before the folder', async () => {
     for (const [error, message] of [
       ['expired', /^The request ran out of time in the browser\. Run the installer again\. Nothing was changed\.\n$/],
@@ -696,6 +745,7 @@ describe('the command', () => {
         /Install must start within 15 minutes\. Signing out blocks any further authorization or download; once the files are downloaded, the install can still finish\./,
       );
       assert.doesNotMatch(prose, /stops it at any point/);
+      assert.match(prose, /https:\/\/127\.0\.0\.1:<port> \(a port other than 443\), or exactly https:\/\/localhost:8443, the local app/);
     }
     for (const flag of ['--version', '-v']) {
       const result = command([flag]);
@@ -703,7 +753,7 @@ describe('the command', () => {
     }
   });
 
-  test('the site must be the local test site, https://127.0.0.1:<port>, and nothing else', () => {
+  test('the site must be a local test site, https://127.0.0.1:<port> or exactly https://localhost:8443, and nothing else', () => {
     const missing = command([]);
     assert.equal(missing.status, 2);
     assert.match(missing.stderr, /Give it with --origin or ORBITION_ORIGIN/);
@@ -711,6 +761,19 @@ describe('the command', () => {
       'https://example.com',
       'https://orbition.example:443',
       'https://localhost:3192',
+      'https://localhost',
+      'https://localhost:443',
+      'https://localhost:8444',
+      'http://localhost:8443',
+      'https://localhost:8443/path',
+      'https://localhost:8443/?next=x',
+      'https://localhost:8443/#x',
+      'https://user@localhost:8443',
+      'https://localhost.:8443',
+      'https://app.localhost:8443',
+      'https://localhost.example:8443',
+      'https://127.0.0.1.nip.io:8443',
+      'https://[::1]:8443',
       'https://[::1]:3192',
       'https://127.0.0.1',
       'https://127.0.0.1:0',
@@ -723,8 +786,27 @@ describe('the command', () => {
     ]) {
       const result = command(['--origin', origin, '--ca', CA]);
       assert.equal(result.status, 2, origin);
-      assert.match(result.stderr, /must be a local test site, https:\/\/127\.0\.0\.1:<port>/, origin);
+      assert.match(
+        result.stderr,
+        /must be a local test site, https:\/\/127\.0\.0\.1:<port> or exactly https:\/\/localhost:8443, and nothing else/,
+        origin,
+      );
     }
+    // The local app is accepted from the flag or the environment, and still
+    // needs its authority; with one, the run goes on (here, to ask for a terminal).
+    assert.equal(LOCAL_APP_ORIGIN, 'https://localhost:8443');
+    for (const [args, env] of [
+      [['--origin', 'https://localhost:8443', '--ca', CA], {}],
+      [['--origin', 'https://localhost:8443/', '--ca', CA], {}],
+      [['--ca', CA], { ORBITION_ORIGIN: 'https://localhost:8443' }],
+    ]) {
+      const accepted = command(args, '', env);
+      assert.equal(accepted.status, 1, args.join(' '));
+      assert.match(accepted.stderr, /^This installer asks questions, so it needs an interactive terminal\./);
+    }
+    const noAuthority = command(['--origin', 'https://localhost:8443']);
+    assert.equal(noAuthority.status, 2);
+    assert.match(noAuthority.stderr, /Give its PEM file with --ca or ORBITION_CA/);
     const fromEnv = command(['--ca', CA], '', { ORBITION_ORIGIN: 'https://example.com' });
     assert.match(fromEnv.stderr, /^ORBITION_ORIGIN must be a local test site/);
     assert.equal(command(['--origin', ORIGIN, '--ca', CA, 'extra']).status, 2);

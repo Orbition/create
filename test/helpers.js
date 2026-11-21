@@ -48,6 +48,59 @@ export function certificate() {
   return { key: readFileSync(key), cert: readFileSync(cert), certPath: cert };
 }
 
+/**
+ * A certificate authority for these tests only, as a local Caddy setup has
+ * one: a root (the only certificate a test trusts), an intermediate it signs,
+ * and `leaf(subjectAltName)` for server certificates the intermediate signs.
+ * A server sends its leaf with the intermediate (`chain`), or the leaf alone.
+ */
+export function authority(label = 'authority') {
+  const directory = temporaryDirectory(label);
+  const file = (name) => path.join(directory, name);
+  let serial = 1;
+  const extensions = (name, lines) => {
+    writeFileSync(file(name), `${lines.join('\n')}\n`);
+    return file(name);
+  };
+  run('openssl', [
+    ...['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-subj', `/CN=${label} root`],
+    ...['-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign'],
+    ...['-keyout', file('root.key'), '-out', file('root.pem')],
+  ]);
+  const signed = (name, subject, signer, lines) => {
+    run('openssl', [
+      ...['req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', subject],
+      ...['-keyout', file(`${name}.key`), '-out', file(`${name}.csr`)],
+    ]);
+    run('openssl', [
+      ...['x509', '-req', '-days', '2', '-in', file(`${name}.csr`)],
+      ...['-CA', file(`${signer}.pem`), '-CAkey', file(`${signer}.key`), '-set_serial', String((serial += 1))],
+      ...['-extfile', extensions(`${name}.ext`, lines), '-out', file(`${name}.pem`)],
+    ]);
+    return { key: readFileSync(file(`${name}.key`)), cert: readFileSync(file(`${name}.pem`)) };
+  };
+  const intermediate = signed('intermediate', `/CN=${label} intermediate`, 'root', [
+    'basicConstraints=critical,CA:TRUE,pathlen:0',
+    'keyUsage=critical,keyCertSign,cRLSign',
+  ]);
+  let leaves = 0;
+  return {
+    root: readFileSync(file('root.pem')),
+    rootPath: file('root.pem'),
+    /** A server certificate for `subjectAltName` (such as DNS:localhost), signed by the intermediate. */
+    leaf(subjectAltName) {
+      leaves += 1;
+      const { key, cert } = signed(`leaf-${String(leaves)}`, '/CN=test server', 'intermediate', [
+        'basicConstraints=critical,CA:FALSE',
+        'keyUsage=critical,digitalSignature,keyEncipherment',
+        'extendedKeyUsage=serverAuth',
+        `subjectAltName=${subjectAltName}`,
+      ]);
+      return { key, cert, chain: Buffer.concat([cert, intermediate.cert]) };
+    },
+  };
+}
+
 export function run(command, args, cwd) {
   return execFileSync(command, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }

@@ -16,11 +16,14 @@
 // Until Install, nothing in the project is changed and no credential exists.
 //
 // The site: until the Orbition site's address is confirmed, only a local test
-// site at https://127.0.0.1:<port> is accepted (--origin or ORBITION_ORIGIN),
-// with its certificate authority given explicitly (--ca or ORBITION_CA; each
-// flag wins over its variable). That file is the only authority trusted for
-// the site, and the certificate is always checked: no other host can vouch for
-// Orbition here.
+// site is accepted (--origin or ORBITION_ORIGIN): https://127.0.0.1:<port>,
+// or exactly https://localhost:8443, the local app. `localhost` is always
+// reached at 127.0.0.1, never looked up, and its certificate is checked for
+// the name `localhost`. The site's certificate authority is given explicitly
+// (--ca or ORBITION_CA; each flag wins over its variable). That file is the
+// only authority trusted for the site, and the certificate chain and name are
+// always checked: no other host can vouch for Orbition here. The browser's
+// answer still comes to http://127.0.0.1:<port>, whichever site it is.
 //
 // Network, in order:
 //
@@ -63,7 +66,7 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { downloadSource, LIMITS } from './download.js';
+import { addressOptions, downloadSource, LIMITS } from './download.js';
 import { InstallError } from './errors.js';
 import { checkBeforeInstall, checkProject, install, RETAINED_DIRECTORY } from './install.js';
 import { choose } from './menu.js';
@@ -159,8 +162,10 @@ Usage:
 
 Options:
   --origin <url>  The Orbition site to sign in on. Until the Orbition site
-                  is confirmed, only a local test site is accepted, as
-                  https://127.0.0.1:<port> (a port other than 443). Without
+                  is confirmed, only a local test site is accepted:
+                  https://127.0.0.1:<port> (a port other than 443), or
+                  exactly https://localhost:8443, the local app (reached at
+                  127.0.0.1, its certificate checked for localhost). Without
                   it, ORBITION_ORIGIN is used; one of the two is required.
   --ca <file>     The local test site's certificate authority: a PEM file
                   holding exactly one certificate, the only one trusted for
@@ -178,10 +183,15 @@ class Stop extends Error {
   }
 }
 
+/** The local app, as a local Caddy setup serves the application. */
+export const LOCAL_APP_ORIGIN = 'https://localhost:8443';
+
 /**
- * The site, only as the local test site: https://127.0.0.1 with a port, and
- * nothing else. No other host is accepted until the Orbition site is
- * confirmed.
+ * The site, only as a local test site: https://127.0.0.1 with a port, or
+ * exactly the local app, https://localhost:8443, and nothing else. No other
+ * host is accepted until the Orbition site is confirmed. `localhost` is
+ * always reached at 127.0.0.1 (see addressOptions in ./download.js) and its
+ * certificate is checked for the name `localhost`.
  */
 function siteOrigin(value) {
   let url;
@@ -192,8 +202,9 @@ function siteOrigin(value) {
   }
   const exact = `${url.origin}/` === url.href && !url.username && !url.password;
   // A port written out (443 is the default, so it never is) and not 0.
-  const local = url.hostname === '127.0.0.1' && Number(url.port) >= 1;
-  return url.protocol === 'https:' && exact && local ? url.origin : null;
+  const loopback = url.hostname === '127.0.0.1' && Number(url.port) >= 1;
+  const app = url.origin === LOCAL_APP_ORIGIN;
+  return url.protocol === 'https:' && exact && (loopback || app) ? url.origin : null;
 }
 
 /** The certificate authority file's PEM text, or why it cannot be used. */
@@ -238,14 +249,16 @@ export function verifyConsent({ origin, ca, code, verifier, signal, timeoutMs = 
  */
 function postJson({ origin, pathname, ca, body, signal, timeoutMs }) {
   const payload = JSON.stringify(body);
+  const target = new URL(pathname, origin);
   return new Promise((resolve, reject) => {
     const outgoing = httpsRequest(
-      new URL(pathname, origin),
+      target,
       {
         method: 'POST',
         agent: false,
         ca,
         rejectUnauthorized: true,
+        ...addressOptions(target.hostname),
         signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
         headers: {
           'Content-Type': 'application/json',
@@ -532,7 +545,7 @@ export async function main({
   const origin = siteOrigin(given);
   if (origin === null) {
     complain(
-      `${from} must be a local test site, https://127.0.0.1:<port>, and nothing else: no other site is accepted until the Orbition site is confirmed.`,
+      `${from} must be a local test site, https://127.0.0.1:<port> or exactly https://localhost:8443, and nothing else: no other site is accepted until the Orbition site is confirmed.`,
     );
     return 2;
   }
